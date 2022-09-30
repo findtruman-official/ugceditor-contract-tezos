@@ -52,13 +52,15 @@ const noOperations: list (operation) = nil;
 type ledger_key is [@layout:comb] record [
   owner: address;
   token_id: token_id
-];
+]
 
 type tokenMetadataParams is [@layout:comb] record [
   metadata: map (string, bytes);
   owner: address;
   token_id: token_id
 ]
+
+type newTokenMetadataParams is list (tokenMetadataParams)
 
 type storage is [@layout:comb] record [
   admin: address;
@@ -84,13 +86,14 @@ type return is list (operation) * storage;
 
 type auroraAction is
   | SetMetadata of metadataParams
-  | AddTokenMetadata of tokenMetadataParams
+  | AddTokenMetadata of newTokenMetadataParams
   | UpdateAdmin of address
   | Update_operators of update_operator_params
   | Transfer of transfer_param_type
   | Balance_of of balance_of_params
   | Pause of unit
   | Unpause of unit
+  | TransferOnlyOwner of transfer_param_type
 
 [@inline] function get_balance(const params: ledger_key; const s: storage): nat is
   case s.ledger[params] of [
@@ -125,6 +128,35 @@ type auroraAction is
       };
     end with s;
 } with (List.fold(make_transfer, param.txs, s))
+
+[@inline] function iterate_transfer_onlyOwner(var s: storage; const param: transfer_type): storage is {
+
+  const sender = Tezos.get_source();
+  const from_: address = param.from_;
+  function make_transfer(var s: storage; const tx: transfer_destination): storage is
+    begin
+      assert_with_error(from_ = sender, "FA2_NOT_OWNER");
+      const from_key = record[
+        owner = from_;
+        token_id = tx.token_id
+      ];
+      const to_key = record[
+        owner = tx.to_;
+        token_id = tx.token_id
+      ];
+      var sender_balance: nat := get_balance(record[owner = from_; token_id = tx.token_id], s);
+      if sender_balance < tx.amount then failwith("FA2_INSUFFICIENT_BALANCE");
+      if (from_ = tx.to_) or (tx.amount = 0n) then skip else {
+        const dest_balance: nat = get_balance(to_key, s);
+        s.ledger[from_key] := abs(sender_balance - tx.amount);
+        if s.ledger[from_key] = Some(0n) then s.ledger := Big_map.remove(from_key, s.ledger);
+        s.ledger[to_key] := dest_balance + tx.amount;
+      };
+    end with s;
+} with (List.fold(make_transfer, param.txs, s))
+
+function fa2_transfer_onlyOwner(const p: transfer_param_type; var s: storage): return is
+   (noOperations, List.fold(iterate_transfer_onlyOwner, p, s))
 
 function fa2_transfer(const p: transfer_param_type; var s: storage): return is
    (noOperations, List.fold(iterate_transfer, p, s))
@@ -166,16 +198,6 @@ function fa2_update_operators(const params: update_operator_params; var s: stora
   s.metadata := params;
 } with s;
 
-type auroraAction is
-  | SetMetadata of metadataParams
-  | AddTokenMetadata of tokenMetadataParams
-  | UpdateAdmin of address
-  | Update_operators of update_operator_params
-  | Transfer of transfer_param_type
-  | Balance_of of balance_of_params
-  | Pause of unit
-  | Unpause of unit
-
 function pause(const _params: unit; var s: storage): storage is {
   if Tezos.get_sender() =/= s.admin then failwith("access denied");
   if Tezos.get_amount() > 0mutez then failwith("dont send tez");
@@ -190,23 +212,22 @@ function unpause(const _params: unit; var s: storage): storage is {
   s.paused := False;
 } with s
 
-[@inline] function addTokenMetadata(const params: tokenMetadataParams; var s: storage): storage is {
+[@inline] function addTokenMetadata(const params: newTokenMetadataParams; var s: storage): storage is {
   if Tezos.get_amount() > 0mutez then failwith("dont send tez");
-  
-  // create new nft token
-  const new_nft: token_metadata_value = record [
-    token_id = s.nextTokenId;
-    token_info = params.metadata
-  ];
-  const new_ledger: ledger_key = record [
-    owner = params.owner;
-    token_id = s.nextTokenId
-  ];
 
-  s.token_metadata := Big_map.add(s.nextTokenId, new_nft, s.token_metadata);
-  s.ledger := Big_map.add(new_ledger, s.nextTokenId, s.ledger);
-  s.nextTokenId := s.nextTokenId + abs(1);
-
+  for param in list params {
+    const new_nft: token_metadata_value = record [
+      token_id = s.nextTokenId;
+      token_info = param.metadata
+    ];
+    const new_ledger: ledger_key = record [
+      owner = param.owner;
+      token_id = s.nextTokenId
+    ];
+    s.token_metadata := Big_map.add(s.nextTokenId, new_nft, s.token_metadata);
+    s.ledger := Big_map.add(new_ledger, abs(1), s.ledger);
+    s.nextTokenId := s.nextTokenId + abs(1);
+  }
 } with s;
 
 function main(const action: auroraAction; const s: storage): return is
@@ -229,4 +250,6 @@ function main(const action: auroraAction; const s: storage): return is
     // pause.ligo
     | Pause(params) -> (noOperations, pause(params, s))
     | Unpause(params) -> (noOperations, unpause(params, s))
+
+    | TransferOnlyOwner(params) -> fa2_transfer_onlyOwner(params, s)
   ]

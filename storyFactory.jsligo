@@ -107,31 +107,134 @@ type tokenMetadataParams =
     token_id: token_id
 };
 
-type storage = 
+type ListTokenMetadataParams = list<tokenMetadataParams>;
+
+type claimAuthorReservedNftParams =
+// @layout:comb
+{
+    storyId: nat,
+    amount: nat
+};
+
+type StoryTasks =
+// @layout:comb
+{
+    storyId: nat,
+    nextTaskId: nat
+};
+
+type Submit =
+// @layout:comb
+{
+    id: nat,
+    creator: address,
+    status: string,
+    cid: string
+};
+
+type Task =
+// @layout:comb
+{
+    id: nat,
+    cid: string,
+    creator: address,
+    nft: address,
+    rewardNfts: list<nat>,
+    status: string,
+    nextSubmitId: nat
+};
+
+type createTaskParams =
+// @layout:comb
+{
+    storyId: nat,
+    cid: string,
+    nft: address,
+    rewardNfts: list<nat>
+};
+
+type submitsKey =
+// @layout:comb
+{
+    storyId: nat,
+    taskId: nat
+};
+
+type taskSubmitsKey =
+// @layout:comb
+{
+    storyId: nat,
+    taskId: nat,
+    submitId: nat
+};
+
+type updateTaskParams =
+// @layout:comb
+{
+    storyId: nat,
+    taskId: nat,
+    cid: string
+};
+
+type balance_of_request =
+// @layout:comb
+{
+    owner: address,
+    token_id: token_id
+};
+
+type balance_of_response =
+// @layout:comb
+{
+    request: balance_of_request,
+    balance: nat
+};
+
+type balance_of_params =
+// @layout:comb
+{
+    requests: list<balance_of_request>,
+    callback: contract<list<balance_of_response>>
+};
+
+type storage =
 // @layout:comb
 {
     nextId: nat,
     storyMap: stories,
     storyNftMap: big_map<nat, storyNftPublish>,
-    nftMap: big_map<nat, address>
+    nftMap: big_map<nat, address>,
+    storyTasks: big_map<nat, StoryTasks>, // key:storyId => value:{storyId, nextTaskId}
+    task: big_map<submitsKey, Task>, // key:{storyId, taskId} => value:Task
+    taskSubmit: big_map<taskSubmitsKey, Submit>, // key:{storyId, submitId, taskId} => value:Submit
+    approvedSubmits: big_map<submitsKey, nat> // key:{storyId, taskId} => value:submitId
 };
 
 type parameter =
 | ["publishStory", string]
 | ["updateStory", storyUpdata]
 | ["publishStoryNft", storyNftPublish_post]
-| ["mintStoryNft", nat];
+| ["mintStoryNft", nat]
+| ["claimAuthorReservedNft", claimAuthorReservedNftParams]
+| ["createTask", createTaskParams]
+| ["updateTask", updateTaskParams]
+| ["cancelTask", submitsKey]
+| ["createTaskSubmit", updateTaskParams]
+| ["withdrawTaskSubmit", taskSubmitsKey]
+| ["markTaskDone", taskSubmitsKey];
 
 type action = | ["Transfer", transfer_param_type];
 
-type manipulate =  | ["AddTokenMetadata", tokenMetadataParams];
+type onlyOwnerAction = | ["TransferOnlyOwner", transfer_param_type];
+
+type manipulate =  | ["AddTokenMetadata", ListTokenMetadataParams];
 
 type return_ = [list<operation>, storage];
 
 const nat2str = (num_: nat): string => {
   let str = "";
   let num = num_;
-  
+
   while (num != (0 as nat)) {
     let posNum = num % (10 as nat);
     switch(posNum) {
@@ -181,7 +284,7 @@ const publishStory = ([cid, store] : [string, storage]): return_ =>{
 
     // Notifies the server of story updates
 
-    return [(list([]) as list<operation>), ({...store, storyMap: story_map, nextId: new_nextId})]
+    return [(list([]) as list<operation>), ({...store, storyMap: story_map, nextId: new_nextId})];
 };
 
 const updateStory = ([updata_story, store] : [storyUpdata, storage]): return_ =>{
@@ -248,17 +351,17 @@ const publishStoryNft = ([storyNft_publish, store] : [storyNftPublish_post, stor
             let initialDelegate : option<key_hash> = (None() as option<key_hash>);
             let initialAmount : tez = 0 as tez;
             let createMyContract = (p: [option<key_hash>, tez, initial_storage]) : [operation, address] =>
-                (Michelson `{ 
+                (Michelson `{
                     UNPAIR ;
                     UNPAIR ;
-                    CREATE_CONTRACT 
-#include     "FT_Nft.tz"  
+                    CREATE_CONTRACT
+#include     "FT_Nft.tz"
                     ;
                     PAIR }`
                     as ((p: [option<key_hash>, tez, initial_storage]) => [operation, address]) )(p);
 
             let originate : [operation, address] = createMyContract(initialDelegate, initialAmount, initialStorage);
-            let new_nftMap = Big_map.add(storyNft_publish.storyId, originate[1], store.nftMap);          
+            let new_nftMap = Big_map.add(storyNft_publish.storyId, originate[1], store.nftMap);
 
             // Notifies the server of storyNft updates
 
@@ -280,14 +383,14 @@ const mintStoryNft = ([story_id, store] : [nat, storage]): return_ =>{
         const storyInfo = Option.unopt(Big_map.find_opt((story_id as nat), store.storyMap));
         const author = storyInfo.author;
         // Determine whether the upper limit has been reached
-        if ((storyNftInfo.sold + storyNftInfo.authorReserve) < storyNftInfo.total){
+        if (storyNftInfo.sold < abs(storyNftInfo.total - storyNftInfo.authorReserve)){
             // Transfer token
             const counter: contract<action> =
                 match(Tezos.get_entrypoint_opt("%transfer" as string, storyNftInfo.token as address) as option<contract<action>>, {
                     Some: ( c: contract<action>) => c,
                     None: () => (failwith ("contract does not match") as contract<action>)
                 });
-            const tr :transfer_param_type = 
+            const tr :transfer_param_type =
                         list([({
                             from_: Tezos.get_sender() as address,
                             txs: list([{
@@ -317,9 +420,10 @@ const mintStoryNft = ([story_id, store] : [nat, storage]): return_ =>{
                     ["", token_info_bytes as bytes]
                 ])),
                 owner: Tezos.get_sender(),
-                token_id: storyNftInfo.sold + (1 as nat)
+                token_id: storyNftInfo.sold + storyNftInfo.authorClaimed + (1 as nat)
             };
-            const ma: operation = Tezos.transaction(AddTokenMetadata(addAdd), 0 as tez, contractAdd);
+            const addAddList : ListTokenMetadataParams = list([addAdd]);
+            const ma: operation = Tezos.transaction(AddTokenMetadata(addAddList), 0 as tez, contractAdd);
             return [(list([op, ma]) as list<operation>), {...store, storyNftMap: new_storyNftPublish}];
         } else {
             return [(list([]) as list<operation>), (failwith("STORY NFT SOLD OUT") as storage)];
@@ -329,11 +433,302 @@ const mintStoryNft = ([story_id, store] : [nat, storage]): return_ =>{
     };
 };
 
+const claimAuthorReservedNft = ([claimAuthorReservedNftParam, store] : [claimAuthorReservedNftParams, storage]): return_ =>{
+    const existJudge: bool = Big_map.mem((claimAuthorReservedNftParam.storyId as nat), store.storyNftMap);
+    if (existJudge == true){
+        const storyInfo = Option.unopt(Big_map.find_opt((claimAuthorReservedNftParam.storyId as nat), store.storyMap));
+        if (storyInfo.author == Tezos.get_sender()) {
+            const storyNftInfo = Option.unopt(Big_map.find_opt((claimAuthorReservedNftParam.storyId as nat), store.storyNftMap));
+            const nftContractAddress : address = Option.unopt(Big_map.find_opt((claimAuthorReservedNftParam.storyId as nat), store.nftMap));
+            if (((storyNftInfo.authorClaimed as nat) + (claimAuthorReservedNftParam.amount as nat)) <= storyNftInfo.authorReserve) {
+                const contractAdd: contract<manipulate> =
+                    match(Tezos.get_entrypoint_opt("%addTokenMetadata" as string, nftContractAddress as address) as option<contract<manipulate>>, {
+                        Some: ( x: contract<manipulate>) => x,
+                        None: () => (failwith ("contract does not match") as contract<manipulate>)
+                    });
+
+                let i: int = 0;
+                let addAddList : ListTokenMetadataParams = list([]);
+                while (i < int(claimAuthorReservedNftParam.amount as nat)) {
+                    const token_info_string: string = storyNftInfo.uriPrefix + "/" + nat2str(storyNftInfo.sold + (abs(i) as nat)) + ".json";
+                    const token_info_bytes: bytes = Bytes.sub(6 as nat, abs(Bytes.length(Bytes.pack(token_info_string)) - (6 as nat)) ,Bytes.pack(token_info_string));
+                    const addAdd :tokenMetadataParams = {
+                        metadata: Map.literal(list([
+                            ["", token_info_bytes as bytes]
+                        ])),
+                        owner: Tezos.get_sender(),
+                        token_id: storyNftInfo.sold + storyNftInfo.authorClaimed + (abs(i) as nat)
+                    };
+                    addAddList = list([addAdd, ...addAddList]);
+                    i = i + 1;
+                };
+                const ma: operation = Tezos.transaction(AddTokenMetadata(addAddList), 0 as tez, contractAdd);
+                const new_authorClaimed = storyNftInfo.authorClaimed + (claimAuthorReservedNftParam.amount as nat);
+                // const new_sold = storyNftInfo.sold + (claimAuthorReservedNftParam.amount as nat);
+                let updata_storyNftPublish = (storyNftInfo: storyNftPublish): storyNftPublish => ({...storyNftInfo, authorClaimed: new_authorClaimed});
+                const new_storyNftPublish = Big_map.update(storyNftInfo.storyId as nat, Some(updata_storyNftPublish(storyNftInfo)), store.storyNftMap);
+                return [(list([ma]) as list<operation>), {...store, storyNftMap: new_storyNftPublish}];
+            } else {
+                return [(list([]) as list<operation>), (failwith("QUANTITY OUT OF RANGE") as storage)];
+            }
+        } else {
+            return [(list([]) as list<operation>), (failwith("IS NOT THE AUTHOR") as storage)];
+        }
+    } else {
+        return [(list([]) as list<operation>), (failwith("N0 STORY NFT") as storage)];
+    };
+};
+
+const createTask = ([createTaskParam, store] : [createTaskParams, storage]): return_ =>{
+    const existJudge: bool = Big_map.mem((createTaskParam.storyId as nat), store.storyMap);
+    // Check if the story for the ID exists
+    if (existJudge == true){
+        const storyInfo = Option.unopt(Big_map.find_opt((createTaskParam.storyId as nat), store.storyMap));
+        // Check whether the current user is the author
+        if (storyInfo.author == Tezos.get_sender()){
+
+            // change nft owner: Temporary processing method: Write the Transfer entry point that only the Owner can use in the NFTSale contract
+
+            const counter: contract<onlyOwnerAction> =
+                match(Tezos.get_entrypoint_opt("%transferOnlyOwner" as string, createTaskParam.nft) as option<contract<onlyOwnerAction>>, {
+                    Some: ( c: contract<onlyOwnerAction>) => c,
+                    None: () => (failwith ("contract does not match") as contract<onlyOwnerAction>)
+                });
+            let transferList : transfer_param_type = list([]);
+            for (const i of createTaskParam.rewardNfts) {
+                const tr : transfer = {
+                    from_: Tezos.get_sender() as address,
+                    txs: list([{
+                            to_: Tezos.get_self_address(),
+                            token_id: i as nat,
+                            amount: 1 as nat
+                        }]) as list<txs>
+                };
+                transferList = list([tr, ...transferList]);
+            };
+            const op: operation = Tezos.transaction(TransferOnlyOwner(transferList), 0 as tez, counter);
+            // update storage
+            const judgeTask: bool = Big_map.mem((createTaskParam.storyId as nat), store.storyTasks);
+            if (judgeTask == true) {
+                const storyTaskInfo : StoryTasks = Option.unopt(Big_map.find_opt((createTaskParam.storyId as nat), store.storyTasks));
+                let taskId = storyTaskInfo.nextTaskId;
+                let update_storyTaskInfo = (storyTaskInfo: StoryTasks): StoryTasks => ({...storyTaskInfo, nextTaskId: storyTaskInfo.nextTaskId + (1 as nat)});
+                const new_StoryTasks : big_map<nat, StoryTasks> = Big_map.update((createTaskParam.storyId as nat), Some(update_storyTaskInfo(storyTaskInfo)), store.storyTasks);
+            } else {
+                let taskId = 1 as nat;
+                const new_StoryTask : StoryTasks = {
+                    storyId: createTaskParam.storyId as nat,
+                    nextTaskId: 2 as nat
+                };
+                const new_StoryTasks : big_map<nat, StoryTasks> = Big_map.add(createTaskParam.storyId, new_StoryTask, store.storyTasks);
+            };
+
+            const new_Task : Task = {
+                    id: taskId,
+                    cid: createTaskParam.cid,
+                    creator: Tezos.get_sender(),
+                    nft: createTaskParam.nft,
+                    rewardNfts: createTaskParam.rewardNfts,
+                    status: "TODO",
+                    nextSubmitId: 1 as nat
+            };
+            const new_key : submitsKey = {
+                storyId: createTaskParam.storyId,
+                taskId: taskId
+            };
+            const new_Tasks : big_map<submitsKey, Task> = Big_map.add(new_key, new_Task, store.task);
+
+            return [(list([op]) as list<operation>), ({...store, storyTasks: new_StoryTasks, task: new_Tasks})];
+        } else {
+            return [(list([]) as list<operation>), (failwith("IS NOT THE AUTHOR") as storage)];
+        }
+    } else {
+        return [(list([]) as list<operation>), (failwith("N0 STORY ID") as storage)];
+    }
+};
+
+const updateTask = ([updateTaskParam, store] : [updateTaskParams, storage]): return_ =>{
+    // Determine whether the author is
+    const storyInfo = Option.unopt(Big_map.find_opt((updateTaskParam.storyId as nat), store.storyMap));
+    if (storyInfo.author == Tezos.get_sender()) {
+        // Determine if the task exists
+        const searchKey : submitsKey = {
+            storyId: updateTaskParam.storyId,
+            taskId: updateTaskParam.taskId
+        };
+        const existJudge: bool = Big_map.mem((searchKey as submitsKey), store.task);
+        if (existJudge == true) {
+            const taskInfo : Task = Option.unopt(Big_map.find_opt((searchKey as submitsKey), store.task));
+            let update_task = (taskInfo : Task): Task => ({...taskInfo, cid: updateTaskParam.cid});
+            const new_task : big_map<submitsKey, Task> = Big_map.update((searchKey as submitsKey), Some(update_task(taskInfo)), store.task);
+            return [(list([]) as list<operation>), ({...store, task: new_task})];
+        } else {
+            return [(list([]) as list<operation>), (failwith("N0 STORY TASK") as storage)];
+        };
+    } else {
+        return [(list([]) as list<operation>), (failwith("IS NOT THE AUTHOR") as storage)];
+    };
+
+};
+
+const cancelTask = ([cancelTaskParam, store] : [submitsKey, storage]): return_ =>{
+    // Determine if it is the creator
+    const searchKey : submitsKey = {
+        storyId: cancelTaskParam.storyId,
+        taskId: cancelTaskParam.taskId
+    };
+    const taskInfo : Task = Option.unopt(Big_map.find_opt((searchKey as submitsKey), store.task));
+    if (taskInfo.creator == Tezos.get_sender()) {
+        // Return NFT
+        // const nftContractAddress : address = Option.unopt(Big_map.find_opt((cancelTaskParam.storyId as nat), store.nftMap));
+        const counter: contract<action> =
+            match(Tezos.get_entrypoint_opt("%transfer" as string, taskInfo.nft) as option<contract<action>>, {
+                Some: ( c: contract<action>) => c,
+                None: () => (failwith ("contract does not match") as contract<action>)
+            });
+        let transferList : transfer_param_type = list([]);
+        for (const i of taskInfo.rewardNfts) {
+            const tr : transfer = {
+                from_: Tezos.get_self_address() as address,
+                txs: list([{
+                        to_: taskInfo.creator as address,
+                        token_id: i as nat,
+                        amount: 1 as nat
+                    }]) as list<txs>
+            };
+            transferList = list([tr, ...transferList]);
+        };
+        const op: operation = Tezos.transaction(Transfer(transferList), 0 as tez, counter);
+        // update storage
+        let update_task = (taskInfo: Task): Task => ({...taskInfo, status: "CANCELLED"});
+        const new_task : big_map<submitsKey, Task> = Big_map.update((searchKey as submitsKey), Some(update_task(taskInfo)), store.task);
+        return [(list([op]) as list<operation>), ({...store, task: new_task})];
+    } else {
+        return [(list([]) as list<operation>), (failwith("IS NOT THE AUTHOR") as storage)];
+    };
+};
+
+const createTaskSubmit = ([createTaskSubmitParam, store] : [updateTaskParams, storage]): return_ =>{
+    // Determine whether the task exists and whether the status is TODO
+    const searchKey : submitsKey = {
+        storyId: createTaskSubmitParam.storyId,
+        taskId: createTaskSubmitParam.taskId
+    };
+    const existJudge: bool = Big_map.mem(searchKey, store.task);
+    if (existJudge == true) {
+        const taskInfo : Task = Option.unopt(Big_map.find_opt((searchKey as submitsKey), store.task));
+        if (taskInfo.status == "TODO") {
+            const new_Submit : Submit = {
+                id: taskInfo.nextSubmitId,
+                creator: Tezos.get_sender(),
+                status: "PENDING",
+                cid: createTaskSubmitParam.cid
+            };
+            // add submit
+            const new_taskSubmitKey : taskSubmitsKey = {
+                storyId: createTaskSubmitParam.storyId,
+                taskId: createTaskSubmitParam.taskId,
+                submitId: taskInfo.nextSubmitId
+            };
+            const new_taskSubmit = Big_map.add(new_taskSubmitKey, new_Submit, store.taskSubmit);
+            // nextSubmitId + 1
+            let update_task = (taskInfo: Task): Task => ({...taskInfo, nextSubmitId: taskInfo.nextSubmitId + (1 as nat)});
+            const new_task : big_map<submitsKey, Task> = Big_map.update((searchKey as submitsKey), Some(update_task(taskInfo)), store.task);
+            return [(list([]) as list<operation>), ({...store, taskSubmit: new_taskSubmit, task: new_task})];
+        } else {
+            return [(list([]) as list<operation>), (failwith("TASK COULD NOT BE SUBMITTED") as storage)];
+        };
+    } else {
+        return [(list([]) as list<operation>), (failwith("NO TASK") as storage)];
+    };
+};
+
+const withdrawTaskSubmit = ([taskSubmitsKeyParam, store] : [taskSubmitsKey, storage]): return_ =>{
+        const searchKey : submitsKey = {
+            storyId: taskSubmitsKeyParam.storyId,
+            taskId: taskSubmitsKeyParam.taskId
+        };
+        const existJudge: bool = Big_map.mem(searchKey, store.task);
+        if (existJudge == true) {
+            const taskInfo : Task = Option.unopt(Big_map.find_opt((searchKey as submitsKey), store.task));
+            if (taskInfo.status == "TODO") {
+                const submitSearchKey : taskSubmitsKey = {
+                    storyId: taskSubmitsKeyParam.storyId,
+                    taskId: taskSubmitsKeyParam.taskId,
+                    submitId: taskSubmitsKeyParam.submitId
+                };
+                const submitInfo : Submit = Option.unopt(Big_map.find_opt((submitSearchKey as taskSubmitsKey), store.taskSubmit));
+                if (submitInfo.creator == Tezos.get_sender()) {
+                    // update
+                    let update_submit = (submitInfo: Submit): Submit => ({...submitInfo, status: "WITHDRAWED"});
+                    const new_taskSubmit: big_map<taskSubmitsKey, Submit> = Big_map.update((submitSearchKey as taskSubmitsKey), Some(update_submit(submitInfo)), store.taskSubmit);
+                    return [(list([]) as list<operation>), ({...store, taskSubmit: new_taskSubmit})];
+                } else {
+                    return [(list([]) as list<operation>), (failwith("IS NOT THE CREATOR") as storage)];
+                };
+            } else {
+                return [(list([]) as list<operation>), (failwith("TASK COULD NOT BE WITHDRAW") as storage)];
+            };
+        } else {
+            return [(list([]) as list<operation>), (failwith("NO TASK") as storage)];
+        };
+};
+
+const markTaskDone = ([markTaskDoneParam, store] : [taskSubmitsKey, storage]) : return_ => {
+    const searchKey : submitsKey = {
+        storyId: markTaskDoneParam.storyId,
+        taskId: markTaskDoneParam.taskId
+    };
+    const existJudge: bool = Big_map.mem(searchKey, store.task);
+    const judgeSubmit: bool = Big_map.mem(markTaskDoneParam, store.taskSubmit);
+    if (existJudge == true && judgeSubmit == true) {
+        const taskInfo : Task = Option.unopt(Big_map.find_opt((searchKey as submitsKey), store.task));
+        const submitInfo : Submit = Option.unopt(Big_map.find_opt((markTaskDoneParam as taskSubmitsKey), store.taskSubmit));
+        if (taskInfo.status == "TODO" && taskInfo.creator == Tezos.get_sender() && submitInfo.status == "PENDING") {
+            let update_task = (taskInfo: Task): Task => ({...taskInfo, status: "DONE"});
+            const new_task : big_map<submitsKey, Task> = Big_map.update((searchKey as submitsKey), Some(update_task(taskInfo)), store.task);
+            let update_submit = (submitInfo: Submit): Submit => ({...submitInfo, status: "APPROVED"});
+            const new_taskSubmit: big_map<taskSubmitsKey, Submit> = Big_map.update((markTaskDoneParam as taskSubmitsKey), Some(update_submit(submitInfo)), store.taskSubmit);
+            const counter: contract<action> =
+                match(Tezos.get_entrypoint_opt("%transfer" as string, taskInfo.nft) as option<contract<action>>, {
+                    Some: ( c: contract<action>) => c,
+                    None: () => (failwith ("contract does not match") as contract<action>)
+                });
+            let transferList : transfer_param_type = list([]);
+            for (const i of taskInfo.rewardNfts) {
+                const tr : transfer = {
+                    from_: Tezos.get_self_address() as address,
+                    txs: list([{
+                            to_: submitInfo.creator as address,
+                            token_id: i as nat,
+                            amount: 1 as nat
+                        }]) as list<txs>
+                };
+                transferList = list([tr, ...transferList]);
+            };
+            const op: operation = Tezos.transaction(Transfer(transferList), 0 as tez, counter);
+            const new_approvedSubmit : big_map<submitsKey, nat> = Big_map.add(searchKey, markTaskDoneParam.submitId, store.approvedSubmits)
+            return [(list([op]) as list<operation>), ({...store, task: new_task, taskSubmit: new_taskSubmit, approvedSubmits: new_approvedSubmit})];
+        } else {
+            return [(list([]) as list<operation>), (failwith("TASK OR SUBMIT COULD NOT BE MARK DONE") as storage)];
+        };
+    } else {
+        return [(list([]) as list<operation>), (failwith("NO TASK OR SUBMIT") as storage)];
+    };
+};
+
 // main
 const main = ([para, store]: [parameter, storage]): return_ =>
   match(para, {
     publishStory: (cid: string) => publishStory(cid, store),
     updateStory: (updata_story: storyUpdata) => updateStory(updata_story, store),
     publishStoryNft: (storyNft_publish: storyNftPublish_post) => publishStoryNft(storyNft_publish, store),
-    mintStoryNft: (story_id: nat) => mintStoryNft(story_id, store)
+    mintStoryNft: (story_id: nat) => mintStoryNft(story_id, store),
+    claimAuthorReservedNft: (claimAuthorReservedNftParam: claimAuthorReservedNftParams) => claimAuthorReservedNft(claimAuthorReservedNftParam, store),
+    createTask: (createTaskParam: createTaskParams) => createTask(createTaskParam, store),
+    updateTask: (updateTaskParam: updateTaskParams) => updateTask(updateTaskParam, store),
+    cancelTask: (cancelTaskParam: submitsKey) => cancelTask(cancelTaskParam, store),
+    createTaskSubmit: (createTaskSubmitParam: updateTaskParams) =>createTaskSubmit(createTaskSubmitParam, store),
+    withdrawTaskSubmit: (taskSubmitsKeyParam: taskSubmitsKey) => withdrawTaskSubmit(taskSubmitsKeyParam, store),
+    markTaskDone: (markTaskDoneParam: taskSubmitsKey) =>markTaskDone(markTaskDoneParam, store)
   });
